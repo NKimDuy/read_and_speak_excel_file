@@ -1,4 +1,3 @@
-import io
 import threading
 import tkinter as tk
 from tkinter import filedialog, ttk
@@ -7,18 +6,41 @@ import sounddevice as sd
 import soundfile as sf
 from gtts import gTTS
 from openpyxl import load_workbook
-
+import librosa
+import numpy as np
+import tempfile
+import os
 
 # ============================================================
 # PHẦN 1 — XỬ LÝ TEXT TRƯỚC KHI ĐỌC
 # ============================================================
 
+# Một số chữ cái gTTS đọc rời rất dễ nghe nhầm với chữ khác
+# (VD: B với P, Đ với D...) nên phải đánh vần rõ thay vì đọc mỗi chữ cái.
+# Muốn đổi cách đọc chữ nào thì sửa trực tiếp ở đây.
+AMBIGUOUS_LETTERS = {
+    "Đ": "đờ",
+    "P": "bê phở",
+    "B": "bê bò",
+    "G": "rờ",
+}
+
+# Ký tự đặc biệt → đọc thành chữ tiếng Việt tương ứng
+SYMBOL_TO_WORD = {
+    "-": "gạch",
+    "/": "xuyệt",
+    ".": "chấm",
+    ",": "phẩy",
+}
+
+
 def preprocess(text):
     """
     Chuyển text thô thành dạng gTTS có thể đọc tiếng Việt đúng.
-    - Chữ cái: giữ nguyên (gTTS tự đọc)
-    - Số: giữ nguyên
-    - Ký tự đặc biệt: chuyển thành chữ tiếng Việt
+    - Chữ cái: đọc rời (gTTS tự đọc), trừ các chữ dễ nghe nhầm ở AMBIGUOUS_LETTERS
+    - Số: giữ nguyên, đọc rời từng chữ số
+    - Ký tự đặc biệt (- / . ,): đổi thành chữ tương ứng
+    - Ký tự khác: bỏ qua
     """
     if text is None:
         return ""  # Tránh lỗi nếu ô Excel bị trống
@@ -28,74 +50,20 @@ def preprocess(text):
     result = []
     for char in text:
         if char.isalpha():
-            result.append(char.upper())   # Chữ cái đọc rời nhau: A, B, C...
+            result.append(AMBIGUOUS_LETTERS.get(char, char))  # Chữ cái đọc rời nhau: A, B, C...
         elif char.isdigit():
-            result.append(char)           # Số đọc rời nhau: 1, 9, 9, 0...
-        elif char == "-":
-            result.append("gạch")
-        elif char == "/":
-            result.append("xuyệt")
-        elif char == ".":
-            result.append("chấm")
-        elif char == ",":
-            result.append("phẩy")
+            result.append(char)  # Số đọc rời nhau: 1, 9, 9, 0...
+        elif char in SYMBOL_TO_WORD:
+            result.append(SYMBOL_TO_WORD[char])
         elif char == " ":
-            result.append(" ")            # Giữ khoảng trắng để ngắt từ tự nhiên
+            result.append(" ")  # Giữ khoảng trắng để ngắt từ tự nhiên
         # Các ký tự khác bỏ qua luôn
 
     return " ".join(result)
 
 
 # ============================================================
-# PHẦN 2 — ĐỌC TEXT THÀNH ÂM THANH
-# ============================================================
-
-def speak(text):
-    """
-    Nhận text, dùng gTTS tạo audio trong RAM rồi phát ra loa.
-    Không tạo file trên ổ cứng.
-    """
-    tts = gTTS(text=text, lang='vi')
-
-    # BytesIO là "file ảo" trong RAM — gTTS ghi MP3 vào đây
-    buf = io.BytesIO()
-    tts.write_to_fp(buf)
-    buf.seek(0)  # Tua về đầu để soundfile có thể đọc từ đầu
-
-    # soundfile giải mã MP3 → numpy array + samplerate
-    data, samplerate = sf.read(buf)
-
-    # sounddevice phát numpy array ra loa
-    sd.play(data, samplerate)
-    sd.wait()  # Chờ phát xong rồi mới return
-
-
-def speak_row(row_data, headers):
-    """
-    Đọc toàn bộ một dòng Excel theo format: [tiêu đề]: [giá trị]
-    row_data: tuple các giá trị của dòng đó
-    headers: list tiêu đề cột
-    """
-    for i, value in enumerate(row_data):
-        if value is None:
-            continue  # Bỏ qua ô trống
-
-        header = headers[i] if i < len(headers) else ""
-
-        # Đọc tên cột trước
-        speak(str(header))
-
-        # Nếu value là datetime thì format trước khi preprocess
-        if hasattr(value, 'strftime'):
-            value = value.strftime("%d/%m/%Y")
-
-        # Đọc giá trị sau (qua preprocess để xử lý ký tự đặc biệt)
-        processed = preprocess(value)
-        speak(processed)
-
-
-# ============================================================
-# PHẦN 3 — ỨNG DỤNG TKINTER
+# PHẦN 2 — ỨNG DỤNG TKINTER
 # ============================================================
 
 class ExcelTTSApp:
@@ -104,6 +72,12 @@ class ExcelTTSApp:
     Dùng class để các phần của app có thể chia sẻ dữ liệu với nhau
     thông qua self (ví dụ self.rows, self.current_index...)
     """
+
+    # --- CẤU HÌNH CỘT — SỬA LẠI CHO KHỚP NẾU CẤU TRÚC FILE EXCEL THAY ĐỔI ---
+    # Các cột cần đánh vần từng chữ/số (index tính từ 0, VD: mã hồ sơ, số CMND/CCCD...)
+    SPELL_OUT_COLUMNS = (0, 3, 7, 8)
+    # Cột "ngành" — nếu trùng với dòng ngay trước thì chỉ đọc "cùng ngành" cho đỡ lặp
+    SAME_AS_PREVIOUS_COLUMN = 6
 
     def __init__(self, root):
         """
@@ -136,6 +110,15 @@ class ExcelTTSApp:
         # reading_thread: thread đang chạy TTS
         # Cần lưu lại để kiểm tra thread còn sống không
         self.reading_thread = None
+
+        # Kiểm tra thông tin ngành dòng trên đã có rồi
+        # thì dòng dưới không cần đọc nữa
+        self.previous_row = None
+
+        # mặc định tốc độ đọc trung bình
+        self.speed_var = tk.DoubleVar(value=1.0)  # mặc định 1.0
+
+        self.audio_lock = threading.Lock()   # khoá bảo vệ thiết bị âm thanh
 
         # --- GIAO DIỆN ---
         self._build_ui()
@@ -193,6 +176,41 @@ class ExcelTTSApp:
             bg="#1e1e2e", fg="#555570",
             font=("Consolas", 9)
         ).pack(side="left")
+
+        # Radio button tốc độ — bên phải hint_frame
+        tk.Label(
+            hint_frame,
+            text=": Tốc độ",
+            bg="#1e1e2e", fg="#a0a0b0",
+            font=("Consolas", 9)
+        ).pack(side="right", padx=(8, 4))
+
+        # Label hiện số tốc độ hiện tại
+        self.speed_label = tk.Label(
+            hint_frame,
+            text="1.0x",
+            bg="#1e1e2e", fg="#7c3aed",
+            font=("Consolas", 9, "bold"),
+            width=4
+        )
+        self.speed_label.pack(side="right")
+
+        # Thanh kéo — từ 0.5x đến 2.0x, bước 0.1
+        tk.Scale(
+            hint_frame,
+            from_=0.5, to=2.0,        # min và max
+            resolution=0.1,            # bước nhảy mỗi lần kéo
+            orient="horizontal",       # kéo ngang
+            variable=self.speed_var,   # gắn với DoubleVar
+            command=self._on_speed_change,  # gọi khi kéo
+            bg="#1e1e2e", fg="#a0a0b0",
+            highlightthickness=0,      # bỏ viền
+            troughcolor="#2a2a3e",     # màu rãnh
+            activebackground="#7c3aed",
+            length=120,                # chiều dài thanh kéo (px)
+            showvalue=False            # ẩn số mặc định của Scale, dùng label riêng
+        ).pack(side="right")
+
 
         # --- BẢNG DỮ LIỆU ---
         # Frame chứa bảng + scrollbar dọc
@@ -280,6 +298,77 @@ class ExcelTTSApp:
     # PHẦN 4 — MỞ FILE EXCEL
     # ============================================================
 
+    def _on_speed_change(self, value=None): 
+        rate = float(value)
+        self.speed_label.config(text=f"{rate:.1f}x")  # hiện số như "1.2x"
+
+    def _find_resume_index(self):
+        """
+        Quét cột cuối + 1 của file Excel để tìm dòng đầu tiên chưa có X.
+        Trả về index đó để current_index bắt đầu từ đây.
+        """
+        sheet = self.workbook.active
+        last_col = len(self.headers) + 1  # Cột chứa dấu X — cột cuối + 1
+
+        for i, row in enumerate(sheet.iter_rows(min_row=2, min_col=last_col, max_col=last_col, values_only=True)):
+            # row là tuple 1 phần tử vì chỉ đọc 1 cột — lấy phần tử đầu
+            value = row[0]
+            if value != "X":
+                return i  # Dòng đầu tiên chưa có X → bắt đầu từ đây
+
+        # Tất cả đều có X → đã đọc hết file
+        return len(self.rows)
+  
+
+    def speak(self, text):
+        """
+        Nhận text, dùng gTTS tạo audio trong RAM rồi phát ra loa.
+        Không tạo file trên ổ cứng.
+        """
+        tts = gTTS(text=text, lang='vi')
+        tmp_path = tempfile.mktemp(suffix=".mp3")
+        tts.save(tmp_path)
+        data, samplerate = sf.read(tmp_path)
+        os.remove(tmp_path)
+
+        # Chụp tốc độ ra biến riêng NGAY ĐÂY — tránh giá trị đổi giữa chừng
+        speed = self.speed_var.get()
+        if abs(speed - 1.0) > 0.01:
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+            data = librosa.effects.time_stretch(data.astype(np.float32), rate=speed)
+
+        # Bọc trong khoá — đảm bảo phát xong hẳn mới nhả cho thao tác khác
+        with self.audio_lock:
+            sd.stop()              # dừng hẳn stream cũ nếu còn sót
+            sd.play(data, samplerate)
+            sd.wait()
+
+    def speak_row(self, row_data, headers):
+        """
+        Đọc toàn bộ một dòng Excel theo format: [tiêu đề]: [giá trị]
+        row_data: tuple các giá trị của dòng đó
+        headers: list tiêu đề cột
+        """
+        for i, value in enumerate(row_data):
+            if value is None:
+                continue  # Bỏ qua ô trống
+
+            if i in self.SPELL_OUT_COLUMNS:
+                processed = preprocess(value)
+                self.speak(processed)
+            elif i == self.SAME_AS_PREVIOUS_COLUMN:
+                if self.previous_row is not None and self.previous_row[i] == value:
+                    # Giống dòng trước → đọc "cùng ngành" thay vì lặp lại
+                    self.speak("cùng ngành")
+                else:
+                    self.speak(str(value))
+            else:
+                self.speak(str(value))
+
+        # Lưu dòng này để so sánh với dòng tiếp theo
+        self.previous_row = row_data
+
     def open_file(self):
         """
         Mở hộp thoại chọn file Excel, đọc dữ liệu vào self.rows.
@@ -298,17 +387,19 @@ class ExcelTTSApp:
         sheet = self.workbook.active
 
         # Lấy tiêu đề từ dòng đầu tiên
-        self.headers = [cell.value for cell in sheet[1]]
+        self.headers = [cell.value for cell in sheet[1] if cell.value is not None]
 
         # Đọc toàn bộ dữ liệu từ dòng 2 trở đi vào RAM
         # values_only=True: lấy giá trị, không lấy object Cell
         self.rows = list(sheet.iter_rows(min_row=2, values_only=True))
 
-        # Reset về trạng thái ban đầu
-        self.current_index = 0
+        # Reset về trạng thái ban đầu, tự tìm dòng cần đọc tiếp (dựa vào cột đánh dấu X)
+        self.current_index = self._find_resume_index()
         self.page = 0
         self.is_reading = False
         self.stop_requested = False
+        # reset dòng dùng để so sánh đọc tên ngành
+        self.previous_row = None
 
         # Cập nhật giao diện
         self._setup_table_columns()
@@ -378,7 +469,7 @@ class ExcelTTSApp:
         target_page = index // self.page_size
         if target_page != self.page:
             self.page = target_page
-            # after(0, ...) để chạy trên main thread — 
+            # after(0, ...) để chạy trên main thread —
             # vì _render_page cập nhật UI, không được gọi từ thread phụ
             self.root.after(0, self._render_page)
 
@@ -457,7 +548,7 @@ class ExcelTTSApp:
             self.root.after(0, self._on_row_start, self.current_index)
 
             # Đọc dòng này — hàm này block cho đến khi đọc xong
-            speak_row(row, self.headers)
+            self.speak_row(row, self.headers)
 
             # Ghi X vào file Excel tại cột cuối + 1
             self._mark_done_in_excel(self.current_index)
